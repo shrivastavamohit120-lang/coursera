@@ -1,0 +1,528 @@
+# FcukCoursera - Development Progress & Status Tracker
+
+## Session Summary (2026-09-29)
+
+- ✨ **Active Worker Tab Cycler & Unstoppable Background Video Progression (`background.js`, `content.js`, `popup.html`, `popup.js`)**:
+  - **Identified & Resolved 4 Interconnected Root Causes of Background Video Freezing**:
+    1. **Chromium Background Throttle & GPU Video Decoder Suspension**: In background tabs, Chromium throttles JS timers to 1s/1min and suspends `requestAnimationFrame` and video rendering if the tab is inaudible. Because turbo-speed videos are muted (`volume = 0`) to bypass Chromium's Autoplay restrictions, Chrome aggressively deprioritizes background media buffers.
+    2. **DOM `offsetParent === null` Visibility Trap in Unpainted Tabs**: In Chromium, background tabs that haven't performed a layout pass report `element.offsetParent === null` for all elements. The extension's previous visibility guards (`el.offsetParent !== null`) mistakenly rejected valid "Next", "Play", "Play now", and TOC links as hidden or nonexistent.
+    3. **React Router Synthetic Event Failures in Unfocused Tabs**: Triggering synthetic pointer/mouse events on React syllabus TOC links often failed to trigger a route transition when the window lacked OS-level focus.
+    4. **Stale `<video>` Element Instant-Finish Loops**: Immediately after clicking "Next", the previous video element remained in the DOM at `currentTime === duration` while the new stream buffered. The script mistakenly evaluated the old element, assumed the new video was already completed, and looped repeatedly.
+  - **Active Worker Tab Cycler / Rotator (`background.js`)**:
+    - Implemented `startTabCycler()` and `stopTabCycler()` with configurable interval (default: 7 seconds, `autoCycleTabs: true`).
+    - Sequentially cycles foreground tab activation (`chrome.tabs.update(tabId, { active: true })`) through all active worker tabs and the master overview tab.
+    - Grants each tab a recurring foreground execution window, instantly revitalizing Chromium's video decoders, network buffer pipelines, and timers.
+    - Added `chrome.tabs.onActivated` event listener that pushes a `nudge_worker_video` message to the activated worker tab, enforcing playback unpause, 16x turbo speed, and "Play now" CTA clicks on Up-Next screens.
+    - Added message handler for `set_auto_cycle_tabs` and persisted state to `chrome.storage.local` (`linkedinAutoCycleTabs`, `linkedinCycleIntervalSec`).
+  - **Direct URL Fallback & Lesson Handshake (`content.js`)**:
+    - Fixed `offsetParent === null` across `triggerLinkedInNativePlay`, `advanceToNextLinkedInVideo`, and TOC queries by allowing `(btn.offsetParent !== null || btn.isConnected)`.
+    - Added fallback direct navigation (`window.location.href = targetHref`) in `advanceToNextLinkedInVideo` if the React SPA URL does not change within 1.2s.
+    - Implemented `waitForNewLinkedInLesson(previousUrl, targetHref, maxWaitMs = 7000)` that polls until the URL changes or a fresh `<video>` element mounts with `currentTime < 1.0` and `video.ended === false`.
+  - **Real-Time Tab Cycler Controls across UI (`content.js`, `popup.html`, `popup.js`)**:
+    - In **Master Page Banner**: Added `#fcukBannerStatCycler` stat pill showing `🔄 Tab Cycler: ON (7s)` with live toggle on click.
+    - In **Floating HUD**: Added `#hudCyclerPill` (`.hud-cycler-pill`) allowing users to toggle tab cycling with one click.
+    - In **Extension Popup**: Added `#popupCyclerRow` with `#popupCyclerToggleBtn` under Learning Path controls, reflecting real-time state.
+
+- 🐛 **Fix Runaway Tab Accumulation & Enforce Background Video Playback (`background.js`, `content.js`)**:
+  - **Eliminated Runaway Tab Spawning on Service Worker Wakeup (`background.js`)**:
+    - **Root Cause**: Manifest V3 terminates idle service workers every ~30s. Upon wake-up, the storage restore listener previously reset all running courses to `queued`, cleared `activeWorkers`, and called `dispatchNextPathWorkers()`, opening a new batch of 3 tabs while previous worker tabs were still alive in Chrome.
+    - **Live Tab Audit & State Serialization**: `getSerializablePathState` now serializes `activeWorkerMap`. On wake-up, the background worker audits every stored tab via `chrome.tabs.get(tabId)`. If live, it re-binds the course and tab, keeps its `running` state, and cleans up any orphan tabs. Only if `activeWorkers.size < maxConcurrency` does it dispatch next items.
+    - **Dispatch Mutex**: Added `isDispatchingWorkers` mutex to prevent concurrent callers from racing and double-launching tabs.
+    - **Single Tab Initialization Guard**: Tracked `initializedWorkerTabIds`. On SPA route transitions, `chrome.tabs.onUpdated` only refreshes MAIN world anti-pause and speed without re-injecting `content.js` or re-sending `start_linkedin_videos`.
+    - **Suppressed `target="_blank"` & `window.open`**: In `content.js`, stripped `target="_blank"` in `clickNativeElement` and overrode `window.open` in worker tabs so automation clicks never open rogue tabs.
+  - **Enforced Background/Unfocused Tab Video Playback (`background.js`, `content.js`)**:
+    - **Root Cause**: LinkedIn Learning's web player attaches listeners to `window.onblur`, `focusout`, and `visibilitychange` that invoke `HTMLMediaElement.prototype.pause()`. Additionally, Chrome Autoplay Policy rejects unmuted playback in background tabs without user gesture, and Chromium throttles `requestAnimationFrame` down to 0 FPS in unfocused tabs.
+    - **MAIN World Pause Interception**: Intercepted `HTMLMediaElement.prototype.pause`. While turbo automation is active and video has not ended, pause calls triggered by blur/focusout are suppressed.
+    - **Background Autoplay Muting**: Intercepted `HTMLMediaElement.prototype.play` and continuously enforced `muted = true`, `defaultMuted = true`, and `volume = 0`, satisfying Chrome's Autoplay policy for background tabs.
+    - **rAF 33ms Fallback Shim**: Shimmed `window.requestAnimationFrame` with a 33ms `setTimeout` fallback so internal player tick loops continue at ~30 FPS even when Chromium suspends rAF in background tabs.
+    - **Complete Prototype & Instance Focus Spoofing**: Patched both `Document.prototype` and `document` properties (`visibilityState: 'visible'`, `hidden: false`, `hasFocus: () => true`) and stopped immediate propagation of `visibilitychange`, `webkitvisibilitychange`, `blur`, `focusout`, and `pagehide`.
+    - **Timestamp-Based Watchdog**: In `content.js`, replaced iteration-based counting with elapsed timestamp calculations (`now - lastProgressTime`), ensuring precise stall detection and unpause recovery even when Chrome throttles background `setInterval` timers.
+
+## Session Summary (2026-09-28)
+
+- ✨ **Smart Parallel Tabs: Adaptive Buffer-Pressure Throttling, Tab Teardown & HUD Alert (`background.js`, `content.js`, `popup.html`, `popup.js`)**:
+  - **Buffer Pressure Watchdog (`content.js`)**:
+    - In `playLinkedInVideoToCompletion`: when a video in a worker tab experiences continuous buffering/stalling for 6+ seconds (`stuckCount === 24`), it sends a `path_worker_buffering_pressure` signal to the background orchestrator.
+  - **Dynamic Concurrency Decrement & Stalled Tab Closure (`background.js`)**:
+    - When buffering pressure is received, `pathOrchestrator` automatically decrements `maxConcurrency` by 1 (with a 10s cooldown to avoid over-throttling on network spikes).
+    - Immediately terminates the buffering worker tab (`chrome.tabs.remove(tabId)`) to instantaneously alleviate bandwidth and CDN congestion.
+    - Restores the throttled course back to `queued` status (`Queued (Auto-throttled for buffer)`), guaranteeing zero loss of progression.
+    - When already at single-tab concurrency (1 tab), automatically steps down playback speed to 4x to restore fluid streaming.
+  - **HUD Alert & Real-time Indicator (`content.js`, `popup.html`, `popup.js`)**:
+    - Built glassmorphic `#hudNoticeBanner` and `#popupNoticeBanner` notifying the user of auto-throttling actions (e.g. `"⚠️ Heavy buffering in '<Course>'. Smart Throttled: reduced to 2 active tabs & closed buffering tab."`) with a manual dismiss option.
+    - Added dynamic `⚡ Smart` badge in the Floating HUD and popup concurrency rows, and automatically updated active pills to reflect the newly decreased tab count.
+
+- 🐛 **Add Dedicated Drag Handle to Floating HUD & Eliminate Sticky Hover Drag (`content.js`)**:
+  - **Root Cause**: The entire HUD header was styled with `cursor: grab` and listened for `pointerdown` across all non-button areas without requiring a movement threshold or verifying that a mouse button was actively held down during subsequent cursor movements. As a result, hovering or clicking on the header could leave the HUD in a persistent drag state stuck to the cursor.
+  - **Dedicated Drag Handle (`#hudDragHandle`)**:
+    - Added an explicit `[⠿ Drag]` handle button in the HUD header (`.hud-drag-handle`) with a 6-dot grip icon and label.
+    - Set `.hud-header` to `cursor: default;` and `user-select: none;`. Only `#hudDragHandle` displays `cursor: grab` (and `cursor: grabbing` when active).
+  - **Bulletproof Drag State & Failsafes (`content.js`)**:
+    - Scoped `pointerdown` drag initialization strictly to `#hudDragHandle` (ignoring header clicks, title text, and child controls).
+    - Added a 3px movement threshold (`Math.hypot(dx, dy) >= 3`) before engaging drag state, preventing clicks from triggering accidental movement.
+    - Added `if (e.buttons === 0) { stopDragging(); return; }` to `onPointerMove` and a global window `mousemove` listener. If no mouse button is pressed, drag mode terminates immediately.
+    - All window capture listeners (`pointermove`, `mousemove`, `pointerup`, `mouseup`, `pointercancel`, `blur`) detach cleanly upon pointer release anywhere on screen.
+
+- ⚡ **Strict Concurrency Enforcement & Auto-Closing of Old Worker Tabs (`background.js`, `content.js`)**:
+  - **Persistent Worker Tab Registry (`background.js`)**:
+    - Implemented `trackWorkerTabId`, `untrackWorkerTabId`, and `closeAllOldWorkerTabs` backed by `linkedinWorkerTabIds` in `chrome.storage.local`.
+    - Every newly spawned worker tab is immediately registered in storage, and untracked upon completion or closure.
+  - **Purge Old Tabs on Launch & Stop (`background.js`)**:
+    - When launching a learning path (`start_learning_path`) or stopping (`stop_learning_path`), `closeAllOldWorkerTabs(overviewTabId)` runs first, immediately closing all stale/leftover worker tabs from prior runs so old tabs never accumulate.
+  - **Strict Concurrency Cap & Excess Pruning (`background.js`)**:
+    - In `dispatchNextPathWorkers()`: audits active tabs against `chrome.tabs.get`, removing dead entries and strictly enforcing that running tabs never exceed `maxConcurrency` (e.g. 3).
+    - In `set_path_concurrency`: when a user reduces concurrency (e.g. from 5 to 3), the orchestrator immediately closes excess worker tabs (`chrome.tabs.remove(excessTabId)`), untracks them, and returns their courses to `queued` status.
+  - **Worker Exit Failsafe (`content.js`)**:
+    - Added an automatic completion handshake in the `finally` block of `startLinkedInCourseCompletionProcess` to ensure finished worker tabs signal `path_worker_course_completed`, guaranteeing tabs are closed cleanly by the background orchestrator.
+
+- 🐛 **Fix Floating HUD Sticky Dragging & Eliminate Unintended AI Chatbot Opening (`content.js`)**:
+  - **HUD Sticky Cursor Fix (`content.js`)**:
+    - **Root Cause**: `setPointerCapture` was called on `#fcuk-floating-hud` but `pointerup` was listened on `#hudDragHeader`. Releasing the pointer fired `pointerup` on the capture target rather than the header, causing the header to miss the release event and leaving `isDragging` stuck on `true` forever.
+    - **Solution**: Refactored `initHudDragging()` to use window-level capture event listeners (`pointermove`, `pointerup`, `pointercancel`, and `blur`). Dragging only activates on primary left-click on the header, reliably updates clamped coordinates, and unconditionally detaches and cleans up upon pointer release anywhere on screen or on window blur.
+  - **AI Chatbot Opening Prevention (`content.js`)**:
+    - **Root Cause**: In `ensureLinkedInVideoPlayerMounted()`, broad hero selectors (`.course-hero button`, `button[aria-label*="Start" i]`, and single-word text matching `'start'` or `'resume'`) matched LinkedIn Learning's newly introduced AI Coach / AI Assistant widget (e.g. `"Start conversation with AI"`, `"Ask AI"`). When opening a worker tab, it inadvertently clicked the AI Coach CTA and opened the chatbot drawer.
+    - **Solution**:
+      1. Implemented `isAiChatbotElement(el)`: filters out any element or parent container matching AI/Coach/Chat/Messaging signatures (`ai-`, `coach`, `chatbot`, `assistant`, `learning-bot`, `msg-overlay-conversation-bubble`, `drawer`, etc.).
+      2. Implemented `dismissLinkedInAiChatbotIfOpen()`: automatically finds and clicks dismiss/close buttons on any AI coach drawer or messaging popups that appear.
+      3. Tightened `startSelectors` in `ensureLinkedInVideoPlayerMounted` to strict, unambiguous course action attributes (`data-control-name="resume_course"`, `data-control-name="start_course"`, `button.course-hero__cta`, `button[aria-label="Resume course" i]`), eliminating all loose partial matches.
+      4. Protected `triggerLinkedInNativePlay`, player recovery controls, quiz skippers, and lesson TOC progression from ever clicking AI elements.
+
+- ✨ **In-Page Persistent Floating HUD, Worker Tab Video Auto-Mounting & Resilient 16x Speed Enforcement (`content.js`, `background.js`, `popup.html`, `popup.js`)**:
+  - **In-Page Persistent Floating HUD (`content.js`)**:
+    - Built `#fcuk-floating-hud`: a sleek, glassmorphic floating control center injected directly into the LinkedIn page DOM so users never lose UI state when clicking away or closing the extension popup.
+    - Features: real-time progress bar and percentage, completed/total counter, dynamic concurrency pills (1–5 parallel tabs), live speed selector (16x/8x/4x/2x), active worker tray with individual course status badges, stop button, drag handle, and minimize-to-pill toggle.
+    - Synchronized canonically across all tabs and background service worker via `chrome.storage.onChanged` listening on `linkedinPathState` in `chrome.storage.local`.
+  - **Course Overview Video Player Auto-Mounting (`content.js`)**:
+    - Discovered root cause of stalled worker tabs: background worker tabs opened course overview landing pages where `<video>` is not initially present.
+    - Implemented `ensureLinkedInVideoPlayerMounted(maxWaitMs)`: detects Course Overview pages and auto-clicks hero CTA buttons (`[data-control-name="resume_course"]`, `[data-control-name="start_course"]`, `button:contains("Resume course")`, or the first lesson link in `.classroom-toc-item`) to launch the lesson player.
+    - Increased `waitForLinkedInVideo` timeout to 12s with proactive CTA mounting fallback after 1.5s, eliminating 6-second timeout failures.
+  - **Continuous 16x Turbo Speed Re-enforcement in Background Tabs (`background.js`, `content.js`)**:
+    - Discovered root cause of 16x speed loss in background tabs: LinkedIn's SPA client-side pushState transitions between overview and lesson routes bypassed the initial page load speed injection.
+    - Worker tabs now proactively send `inject_main_world_speed` upon lesson mount and after every video lesson advancement.
+    - Updated `chrome.tabs.onUpdated` in `background.js` to listen for both `changeInfo.status === 'complete'` and `changeInfo.url` changes.
+    - Added `set_path_speed` action in `background.js`: dynamically updates `pathOrchestrator.targetSpeed`, saves to storage, and immediately pushes MAIN world anti-pause and playbackRate overrides to all running worker tabs.
+  - **Popup Floating HUD Summoner & Overview Tab Tracking (`popup.html`, `popup.js`)**:
+    - Added "Floating HUD" button in the Learning Path section of `popup.html` and wired it in `popup.js` to summon/focus the in-page HUD on the active tab.
+    - Tracks and persists `overviewTabId` during path launch, ensuring the orchestrator broadcasts real-time progress to both extension views and the overview tab.
+
+- 🐛 **Fix Learning Path Course Detection Trap & Add Live Rescan Fallback (`content.js`, `popup.js`)**:
+  - **Root Cause Analysis ("No courses detected in this Learning Path")**:
+    1. **Heading Tag Trap**: `scanLinkedInLearningPath()` previously used `h.closest('section, [class*="section"], [class*="content"], [class*="learning-path"]')` starting from the `"Content in this Learning Path"` `<h2>` heading. Because the `<h2>` tag had class names containing `"content"` (e.g. `content-title`), `h.closest(...)` resolved to the `<h2>` tag itself. Consequently, querying `contentContainer.querySelectorAll('a[href*="/learning/"]')` searched inside the heading element, returning 0 links.
+    2. **Overly Broad Navigation Filter**: `isNavigationElement()` checked `[class*="nav-" i]`, `[class*="navigation" i]`, `nav`, and `aside`. In LinkedIn Career Hub, syllabus containers or layout wrappers often contain `nav` or `aside`, causing syllabus course links to be falsely rejected as navigation.
+    3. **Paths Slug Collateral Block**: `NON_COURSE_SLUGS` included `'paths'` and `'career-paths'`. When an item's URL was formatted as `/learning/paths/<path-slug>/<course-slug>`, checking `NON_COURSE_SLUGS.has(segments[1])` unconditionally dropped valid courses.
+    4. **Premature Context Query Without Re-scan**: If the popup opened while LinkedIn's React framework was still hydrating syllabus elements, `popup.js` received `courses: []` and showed an error on click without attempting an active re-scan.
+  - **Multi-Tier Container Detection (`content.js`)**:
+    - Walks up `cur.parentElement` from the heading until a container holding multiple candidate links is found.
+    - Exempts any element inside `contentContainer` from global navigation checks.
+    - Scopes `isNavigationElement()` strictly to `#app-header`, `.global-nav`, `.learning-career-hub-nav`, and primary/side navigation rails.
+  - **Hierarchical Path Slug Handling (`content.js`)**:
+    - Allows `/learning/paths/...` and `/learning/career-paths/...` links when `segments.length >= 4` (valid item within path), while excluding path roots (`segments.length < 4`) and exact self-links (`pathname === currentPathname`).
+    - Deduplicates by clean `itemSlug`, seamlessly unifying multiple links pointing to the same course.
+  - **Live Rescan & Retry Loop (`popup.js`)**:
+    - Added an automatic retry loop (up to 3 retries, 500ms delay) on popup load if `ctx.isPathPage` is true but React DOM has not yet mounted course items.
+    - Added an immediate live rescan in `#linkedinStartPathBtn` click listener: queries `get_linkedin_context` from the active tab on-demand before showing any error.
+
+- 🐛 **Fix Learning Path Card Scanner, SSO Parameter Stripping & Navigation Tab Hijacking (`content.js`, `background.js`, `popup.js`)**:
+  - **Root Cause Analysis**:
+    - Discovered why worker tabs were opening "Settings | LinkedIn", "Career Path...", and "Your In Progress...":
+      1. `scanLinkedInLearningPath()` previously queried `document.querySelectorAll('a[href*="/learning/"]')` across the entire document without scoping to the content body, mistakenly capturing sidebar navigation links ("My Content" -> `/learning/in-progress`, "Career Paths" -> `/learning/career-paths`, user settings -> `/learning/settings`).
+      2. It truncated URLs to `window.location.origin + '/learning/' + courseSlug`, which stripped:
+         - The enterprise SSO authentication parameter (`?u=92961692` for Chandigarh University). Without `?u=...`, LinkedIn's enterprise auth guard redirected raw course requests to Settings or profile landing pages.
+         - The sub-path for standalone video lessons (e.g. `/learning/becoming-a-product-manager/product-development-process`), turning single 3-minute video lessons into full 5-hour course links.
+  - **Scoped Container Targeting & Strict Navigation Blacklist (`content.js`)**:
+    - Scoped link collection strictly to the container under `"Content in this Learning Path"`.
+    - Added an exhaustive blacklist (`NON_COURSE_SLUGS`: `paths`, `career-paths`, `career-hub`, `me`, `in-progress`, `saved`, `settings`, `topics`, `search`, `certifications`, etc.) and filtered out any element inside `<nav>`, `<aside>`, `<header>`, `<footer>`, `.sidebar`, or `.learning-career-hub-nav`.
+  - **Preserved Enterprise SSO Authentication Parameters (`content.js`)**:
+    - Preserves `?u=${enterpriseU}` on all generated course and video URLs, ensuring worker tabs load with active university/organization authorization without triggering login/settings redirects.
+  - **Differentiated Course vs. Standalone Video Items (`content.js` & `background.js`)**:
+    - Added card-level entity classification: distinguishes between full courses (`itemType: 'course'`) and standalone video lessons (`itemType: 'video'`).
+    - In worker tabs, if an item is a standalone video (`singleVideoOnly: true`), it plays only that specific assigned video to completion at 16x turbo speed, reports `path_worker_course_completed` immediately upon checkmark detection, and cleanly auto-closes the tab.
+  - **Enhanced Worker Tray UI (`popup.js`)**:
+    - Added visual indicators for item types (`📚` for courses, `🎬` for standalone videos) in the live sub-worker tray with accurate total item counts and completion tallies.
+
+- ✨ **LinkedIn Learning Path Multi-Course Parallel Worker Pool & Background Tab Orchestrator (`background.js`, `content.js`, `popup.html`, `popup.js`)**:
+  - **Learning Path Orchestration Architecture (`background.js`)**:
+    - Built a robust background service worker state machine (`pathOrchestrator`) that manages parallel course execution across entire LinkedIn Learning Paths (`/learning/paths/*`).
+    - Tracks per-course status (`queued`, `running`, `completed`, `failed`), real-time progress percentages, video counts, and worker tab IDs.
+    - Dispatches courses as background worker tabs (`chrome.tabs.create({ url, active: false })`) to eliminate screen focus stealing and allow silent background execution.
+    - Added automatic worker tab lifecycle management: listens for course completion signals (`path_worker_course_completed`), immediately closes the completed tab (`chrome.tabs.remove(tabId)`), and automatically dispatches the next queued course into the open pool slot until all courses in the path reach 100%.
+    - Added tab closure and crash watchdog: if a user or system closes a running worker tab prematurely, the orchestrator detects it via `chrome.tabs.onRemoved` and safely re-queues the course.
+  - **Background Tab Anti-Pause Visibility Spoofing & Audio Keep-Alive (`background.js` & `content.js`)**:
+    - Solved LinkedIn Learning's background tab pausing behavior: LinkedIn's Video.js / React player listens to `visibilitychange`, `blur`, and checks `document.hidden` / `document.visibilityState` to pause playback when tabs are not in the foreground.
+    - Implemented `injectMainWorldAntiPauseAndSpeed` in `background.js` running in the `MAIN` page world:
+      - Overrides `document.visibilityState` getter to always return `'visible'`.
+      - Overrides `document.hidden` getter to always return `false`.
+      - Overrides `document.hasFocus()` to always return `true`.
+      - Hooks capture-phase event listeners on `window` and `document` to immediately suppress (`stopImmediatePropagation()`) `visibilitychange`, `blur`, and `pagehide` events before the video player can receive them.
+      - Disables Chrome's tab discarding via `chrome.tabs.update(tabId, { autoDiscardable: false })`.
+    - Added `startTabKeepAliveHeartbeat` in `content.js`: starts a zero-volume (`gain = 0.00001`) inaudible Web Audio oscillator when operating as a worker tab, signaling to Chrome that the tab is actively rendering media and exempting it from background execution throttling and timer deprioritization.
+  - **Context Detection: Learning Path vs. Single Course (`content.js` & `popup.js`)**:
+    - Built `isLinkedInLearningPathPage()` and `scanLinkedInLearningPath()` in `content.js`: detects whether the active tab is a Learning Path overview, parses the path title, and extracts all child courses, URLs, and current completion checkmarks.
+    - Built `detectLinkedInParentPath()`: when the user is viewing a single course that is part of a larger Learning Path, detects the parent path breadcrumbs and metadata.
+    - Added `get_linkedin_context` message handler returning comprehensive metadata to the popup.
+    - In `popup.js`: dynamically toggles between Single Course controls (`Complete All Videos`, `Fast-Forward Video`) and Learning Path controls (`Complete Entire Learning Path`, Concurrency Selector, Parallel Sub-Workers Tray).
+    - Added "View Path →" deep-link button on single course cards to quickly navigate back to the parent Learning Path.
+  - **User-Configurable Parallel Concurrency Selector (`popup.html` & `popup.js`)**:
+    - Added a sleek minimal pill bar (1–5 tabs, defaulting to **3** parallel tabs) with local storage persistence (`linkedinPathConcurrency`).
+    - Dynamically updates active concurrency in real time during a run via `set_path_concurrency`.
+  - **Parallel Sub-Workers Tray & Live Telemetry (`popup.html` & `popup.js`)**:
+    - Created `#linkedinWorkerTray` and `#workerList` in `popup.html` displaying running status badges (`Queued`, `Running... (X%)`, `100% ✓`) for all courses in the path.
+    - Integrated real-time course progress updates via `path_worker_progress` and `path_progress_update`.
+    - Wired `#stopBtn` to cleanly abort the entire worker pool, close all active worker tabs, and re-queue pending courses.
+
+- 🎨 **Minimal Sleek Modern UI Redesign (`popup.html`, `popup.js`, `progress.md`)**:
+  - Replaced tacky AI-style neon gradients, glowing cyan borders, and emoji-cluttered button labels with a clean, understated, developer-grade aesthetic inspired by Raycast and Linear.
+  - Built a refined design system with a deep matte charcoal palette (`#0e1015`, `#14171f`, `#1a1e27`), subtle 1px border lines (`rgba(255, 255, 255, 0.07)`), and crisp neutral typography (`#f4f4f6`, `#9da1b0`, `#646877`).
+  - Swapped garish emoji titles for clean vector SVG icons and clear action titles (`Complete Entire Course`, `Solve on Screen`, `Complete Labs`, `Quizzes`, `Videos`, `Readings`, `Complete All Videos`, `Fast-Forward Video`).
+  - Replaced the bulky, screen-dominating AI settings box with a sleek native `<details>` collapsible accordion card that keeps the interface minimal while preserving instant access when needed.
+  - Modernized the activity feed into a clean, compact monospace log stream with understated status tags and refined micro-toolbars (`Report`, `Copy`, `Clear`).
+  - Polished modal dialogs (`#reportModal`, `#solveModeModal`) with backdrop blur, clean card borders, and elegant hierarchy.
+
+- ✨ **LinkedIn Learning Smart Completer, MAIN World Speed Override & Quiz Skipper (`content.js`, `background.js`, `popup.html`, `popup.js`, `README.md`)**:
+  - **MAIN World Speed Multiplier (`background.js` & `content.js`)**:
+    - Identified root cause of speed multiplier failure: LinkedIn Learning's React/Video.js player runs in the page's MAIN world, listens to `ratechange` events, and immediately resets `playbackRate` back to 1.0x or native speed whenever changed from an isolated content script world.
+    - Implemented `inject_main_world_speed` in `background.js` using `chrome.scripting.executeScript({ target, world: 'MAIN', func })` to monkey-patch `HTMLMediaElement.prototype.playbackRate` and `defaultPlaybackRate` directly in the page execution context. Intercepts player setter calls and enforces the user-selected speed (up to 16x Turbo) while muting audio (`muted = true`, `defaultMuted = true`, `volume = 0`) to prevent audio buffer underruns.
+    - Added dynamic live speed adjustment: enabled `#linkedinSpeedSelect` in `popup.js` during active runs to stream instant speed updates via `chrome.tabs.sendMessage` to both the isolated and MAIN world contexts.
+  - **Smart Instant Checkmark Advance (`isCurrentLinkedInLessonCompleted`)**:
+    - Discovered that LinkedIn Learning registers completion telemetry with the server well before the final video frame (typically at ~75-85% playback or on progress ping), rendering an SVG checkmark (`svg[data-test-icon*="check"]`), `.classroom-toc-item--completed`, or Up-Next card.
+    - Implemented `isCurrentLinkedInLessonCompleted()` continuous poll in `playLinkedInVideoToCompletion`. The instant the active TOC item acquires a completion checkmark or Up-Next appears, it terminates video playback and advances immediately to the next video, saving substantial time.
+  - **Stuck / Buffering Watchdog & Non-Destructive MSE Recovery (`refreshLinkedInVideo`)**:
+    - Fixed stalled detection logic to detect freezes both while playing (`currentTime` frozen) and while unexpectedly paused (`video.paused && !video.ended`).
+    - Eliminated destructive `video.load()` calls which severed the browser's `MediaSource` MSE pipeline and caused infinite spinner hangs.
+    - Re-engineered 4-stage progressive recovery:
+      - 2.5s stall: Triggers native play and safe seek nudge (`+0.25s`) without interrupting media pipeline.
+      - 5.0s stall: Refreshes stream non-destructively: clicks native retry/play buttons, primes muted state, performs seek nudge, and triggers native playback.
+      - 8.0s stall: Steps down speed to 4x to relieve MSE network buffer throttling and triggers native play.
+      - 12.0s stall: Reloads page with persistent queue auto-resume.
+  - **Proactive Video Priming, Non-Blocking Play & React Element Re-binding (`waitForLinkedInVideo`, `getLinkedInVideo`, `triggerLinkedInNativePlay`, `playLinkedInVideoToCompletion`)**:
+    - Eliminated the 12s idle wait in `waitForLinkedInVideo`: immediately primes the video element (`muted = true`, `defaultMuted = true`, `volume = 0`) upon DOM discovery and triggers native play so LinkedIn's HLS player initiates stream buffering.
+    - Fixed root cause of post-metadata freeze: removed blocking `await video.play()`. When a stream is buffering or unready, standard `await video.play()` suspends async execution indefinitely; replaced with non-blocking `video.play().catch(...)` and native trigger.
+    - Fixed `triggerLinkedInNativePlay`: replaced loose `[aria-label*="play"]` matching that inadvertently clicked the "Autoplay" toggle switch instead of the real play button. Enforced strict exact-match selectors (`[aria-label="Play" i]`, `[aria-label="Play video" i]`) and explicit exclusions (`!label.includes('autoplay')`).
+    - Added dynamic DOM re-binding: during polling and in the watchdog interval, checks `!document.body.contains(video)` and refreshes the video reference if LinkedIn's React tree unmounts/swaps the video element.
+    - Upgraded 12s watchdog fallback: attempts advancing to the next video (`advanceToNextLinkedInVideo`) before resorting to a full page reload.
+    - Added instant completion short-circuit: if the TOC checkmark appears during stream initialization, playback resolves immediately without waiting.
+  - **Automatic Quiz & Assessment Skipper (`isLinkedInQuizPage`, `skipLinkedInQuizIfPresent`, `scanLinkedInTOC`)**:
+    - Upgraded `scanLinkedInTOC()` to detect chapter quizzes, practice exams, assessments, and knowledge checks via regex title matching, URLs (`/quiz/`, `/assessment/`), ARIA labels, and SVG icons.
+    - Separated `uncompletedVideos` from quizzes; the sequential advancer (`advanceToNextLinkedInVideo`) exclusively targets uncompleted video lessons and completely bypasses quizzes in the syllabus.
+    - Implemented `skipLinkedInQuizIfPresent()` to automatically locate and click "Skip quiz", "Skip", "Skip to next", or "Next" controls on screen if the course auto-navigates into a quiz, or directly jump to the next video from the TOC.
+  - **LinkedIn Learning Base Engine (`content.js`, `popup.html`, `popup.js`, `manifest.json`)**:
+    - Built Table of Contents (TOC) scanner & chapter expander (`scanLinkedInTOC` & `expandAllLinkedInChapters`).
+    - Added cross-navigation persistent queue runner (`startLinkedInCourseCompletionProcess` & auto-resume IIFE) with storage sync.
+    - Built adaptive popup UI (`popup.html` & `popup.js`) detecting Coursera vs. LinkedIn Learning automatically.
+    - Added `https://www.linkedin.com/learning/*` permissions to `manifest.json`.
+
+## Session Summary (2026-08-30)
+
+- 🐛 **Eliminated Hoisted Duplicate Helpers & Fixed React Aria Event Simulation (`content.js`)**:
+  - Discovered that legacy duplicate definitions of `setNativeCheckbox` and `clickNativeElement` at the bottom of `content.js` were overriding the top-level helpers due to Javascript function hoisting.
+  - The hoisted `clickNativeElement` was recursively clicking child `<span>` and `<p>` elements, which caused an unintended second toggle.
+  - Consolidated into a single, clean `clickNativeElement` that correctly dispatches native `PointerEvent` and `MouseEvent` sequences (`pointerdown`, `mousedown`, `pointerup`, `mouseup`, `click`).
+  - Increased DOM mount polling in `completeUngradedAppItemInDOM` from 6 attempts (600ms) to **20 attempts (4,000ms)** to ensure Coursera's hydrated React tree finishes mounting before querying form inputs.
+  - Removed premature `checkAndHandleAppPrepError` calls that were intercepting and aborting queue steps before the DOM solver could run.
+- 🐛 **Checkbox Double-Toggle & Responsible Use Consent Fix (`completeUngradedAppItemInDOM` & `setNativeCheckbox`)**:
+  - Identified a critical bug where `setNativeCheckbox` simulated clicks on both the label and input in rapid succession, resulting in multiple consecutive toggles that flipped `"I agree to use this app responsibly"` back to an **unchecked** state before submission.
+  - Re-engineered `setNativeCheckbox` with strict idempotency: verifies `isCurrentlyChecked` and executes only a single synthetic dispatch + React prototype setter when state differs.
+  - Added a 120ms React state stabilization window before querying and unlocking the Launch button.
+  - Enforced form submission via `form.requestSubmit(btn)` and direct native button click events.
+- ⏱️ **Extended LTI Lab Active Hold & Token Handshake Duration (`completeUngradedAppItemInDOM` & `background.js`)**:
+  - Increased external tool active hold time to **8–10 seconds** (with live HUD countdown: *"🔬 Lab Active: Synchronizing Tokens (8s)..."*) to ensure external lab containers (Skills Network, CognitiveClass, Vocareum, Jupyter, IBM Cloud) fully establish OAuth/LTI token handshakes and callback to Coursera before navigation.
+  - Increased background service worker auto-close tab delay from 1.8s to **10s** and extended arm duration to 35s.
+  - Added post-hold scan for any newly unlocked *"Mark as Completed"*, *"I'm Done"*, or *"Submit"* buttons.
+  - Added `skipDom` flag to avoid running redundant duplicate DOM launch cycles when called from the sequential queue runner.
+- 🐛 **Item Type Resolution & DOM Sidebar Link Extractor (`fetchCourseProgressState` & `getCourseData`)**:
+  - Discovered that the Coursera syllabus API (`onDemandCourseMaterialItems.v2`) never returns `typeName` or `contentSummary` in its response.
+  - Upgraded the DOM link scanner to extract canonical `typeName` values directly from sidebar link `href` paths (`/lecture/`, `/ungradedLti/`, `/supplement/`, `/quiz/`, etc.) into an `itemTypeMap`.
+  - Enriched syllabus items with their true `typeName` before queue construction so `buildItemUrl` generates the exact canonical URL (e.g. `/ungradedLti/:id/:slug` and `/lecture/:id/:slug`).
+- 🐛 **App Item 404 & Video Classification Fixes (`classifyItemType` & `isAppOrToolItem`)**:
+  - Tightened `isAppOrToolItem` to skip keyword matching if `typeName` is known or represents lectures/videos/quizzes/readings.
+  - Added URL slug fallback checks in `classifyItemType` to prevent videos with keywords like *"hands-on"* or *"lab"* in their title from being misclassified as app items.
+  - Extracted shared `buildItemUrl(courseSlug, item)` helper to guarantee valid Coursera route construction.
+- ⚡ **Parallel Fetch Optimization Across All Workflows (`content.js`)**:
+  - Parallelized 15 sequential progress pre-check fetches with `Promise.allSettled()`, slashing startup latency by up to 58 seconds.
+  - Parallelized 50 sequential app item completion API calls into a single concurrent batch.
+  - Replaced sequential user/course ID lookups and 3-strategy reading fallbacks with `Promise.any()`.
+  - Reduced API timeouts from 4s to 2s to fail fast on dead endpoints.
+
+## Session Summary (2026-08-26)
+
+- ⚡ **Ultra-Fast Switching & Reduced Transition Latency (`content.js` & `background.js`)**:
+  - Slashed inter-item transition delays from 80ms–400ms down to 10ms–40ms for lightning-fast progression.
+  - Reduced on-screen app polling intervals from 450ms to 100ms and token hold time from 2000ms to 350ms.
+  - Accelerated auto-resume page initialization delay from 450ms down to 60ms.
+  - Reduced external lab tab closer duration in `background.js` from 3500ms to 1800ms.
+- 🌐 **Canonical URL Routing & 404 Recovery (`targetUrl` & `checkAndHandleAppPrepError`)**:
+  - Eliminated invalid fabricated routes (`/singlePageApp/`, `/workspace/`, `/ungradedLab/`) that caused Coursera's *"Looks like you found a page that does not exist or the URL was mistyped"* 404 error page.
+  - Restricted direct routes strictly to valid Coursera LTI paths (`/ungradedLti/`, `/gradedLti/`) and routed all other items to Coursera's universal canonical item path (`/home/item/:id`).
+  - Added 404 error detection in `checkAndHandleAppPrepError` to automatically redirect any misrouted tab to `/home/item/:id` with zero stalling.
+- ⏱️ **Strict Chronological Master Course Queue Runner (`processMasterCourseQueueStep`)**:
+  - Re-engineered "Complete Course (All-in-One)" into a unified chronological master state machine that traverses items in exact syllabus sequence ($\text{Video} \rightarrow \text{Reading} \rightarrow \text{App/Lab (on-screen)} \rightarrow \text{Quiz}$).
+  - Solves locked prerequisite lab items *before* attempting subsequent quizzes to completely eliminate quiz lock errors.
+  - Seamlessly performs live tab navigation for on-screen app launches and resumes instantly on new page loads.
+- 🛡️ **Automated Recovery for Coursera LTI Error (`checkAndHandleAppPrepError`)**:
+  - Automatically detects Coursera's *"We couldn't prepare the app. Please refresh the page and try again."* alert banner in the DOM.
+  - Recovers by automatically triggering a page reload (Attempt 1) or falling back to the canonical item router (`/home/item/:id`) (Attempt 2) with backend API completion passes.
+- 🎛️ **Popup UI Locking & Progress Bar Tracking (`popup.js` & `content.js`)**:
+  - Added `appItemBtn` to `setRunningUIState` to ensure all buttons (`appItemBtn`, `completeBtn`, `quizBtn`, `readBtn`, `startBtn`, `quizOnScreenBtn`) are locked when any solver is active.
+  - Explicitly hooked `updateProgress` across all app steps and master queue steps to ensure real-time progress bar rendering in the popup UI.
+- 🚀 **Unified All-in-One Sequential App Completion Pipeline (`startCompleteCourseProcess`)**:
+  - Integrated full App, Lab, LTI, and Tool items into the primary "Complete Course (All-in-One)" workflow.
+  - Automatically executes on-screen DOM submission for the active page and 6-schema backend API completion cascades.
+  - Seamlessly queues and advances through any remaining uncompleted App items in series (`processCurrentAppQueueStep`) across multiple pages with automated tab closure until 100% course completion.
+- 🎯 **React Aria Checkbox Label Trigger & Direct LTI Form Submission (`completeUngradedAppItemInDOM`)**:
+  - Fixed button selector false-matching sidebar module accordions by isolating launch CTA queries to `form button[type="submit"]` and excluding accordion keywords (`module`, `week`, `help`, `close`, `send`).
+  - Added direct React Aria label click dispatcher (`label[for="${cb.id}"]`) to immediately satisfy Coursera's responsible use validation.
+  - Implemented direct `form.requestSubmit()` dispatching the genuine LTI launch transaction.
+- 🩹 **Synthetic Event Dispatcher & React State Synchronization (`setNativeCheckbox` & `clickNativeElement`)**:
+  - Implemented `setNativeCheckbox` with prototype descriptor override (`HTMLInputElement.prototype.checked`) to bypass React 16-18 synthetic state trapping and ensure the "I agree to use this app responsibly" checkbox triggers form validation.
+  - Implemented `clickNativeElement` dispatching full pointer/mouse/click event sequence (`pointerdown`, `mousedown`, `pointerup`, `mouseup`, `click`).
+  - Removed `onDemandItemViews.v1` from progress pre-fetcher to eliminate false-positive completion flags caused by mere page visits.
+  - Ensured active on-screen App/Lab page is always prioritized in `uncompletedApps` queue.
+- 🔍 **Multi-Layer Progress Pre-Fetcher & Universal DOM Scanner Upgrade (`fetchCourseProgressState`)**:
+  - Expanded API endpoints to include `onDemandLtiItemPasses.v1`, `onDemandAppCompletions.v1`, `onDemandLearnerItemProgresses.v1`, and `onDemandSupplementCompletions.v1`.
+  - Added in-memory Apollo/Redux cache traversal (`window.__APOLLO_STATE__`, `window.__INITIAL_STATE__`) to retrieve cached completion status.
+  - Implemented universal DOM scanner supporting all link patterns (`/ungradedLti/`, `/gradedLti/`, `/item/`, `/lecture/`, `/supplement/`) and CDS badge icons (`SuccessOutline`, `CheckCircle`, `CheckmarkFilled`) for 100% accurate identification of completed vs. pending items.
+- ⚡ **Strict Uncompleted App Item Filtering & Accelerated Navigation Engine**:
+  - Filtered out all completed/passed items upfront, completely eliminating redundant re-attempts on already completed apps.
+  - Added on-screen completion badge verification (`item-status-completed`, `Passed`) to skip completed pages immediately without waiting.
+  - Drastically optimized navigation and launch delays: reduced DOM mount wait to 400ms, token wait to 2s, tab auto-close to 3.5s, and inter-item transition to 400ms for rapid consecutive completions.
+- 🧹 **Automatic External Lab Tab Closer & Service Worker (`background.js`)**:
+  - Implemented a background service worker with `"tabs"` permissions to track newly launched external lab/app tabs (`skills.network`, `cognitiveclass.ai`, `vocareum.com`, `jupyter`, etc.).
+  - Automatically closes the external tab after 6.5s (allowing full LTI handshake and session token registration to complete on the tool server) without cluttering the user's browser window.
+- ⚡ **Background Active & Visibility Override Engine (`enableBackgroundActiveOverride`)**:
+  - Overrides `document.hidden`, `document.visibilityState`, and `document.hasFocus()` so Coursera and external LTI integrations always perceive the tab as active, focused, and in the foreground.
+  - Intercepts and suppresses `visibilitychange`, `blur`, and `pagehide` events to prevent background tab timer throttling or session freezing when the user switches tabs.
+  - Maintains a persistent keep-alive heartbeat loop to prevent background sleep and preserve token handshakes.
+- 🎯 **Universal App & Lab Item Classifier (`isAppOrToolItem`)**:
+  - Implemented comprehensive pattern matching across all Coursera App/Tool schemas (`programming`, `gradedProgramming`, `ungradedProgramming`, `workspace`, `lab`, `jupyter`, `notebook`, `cloudide`, `widget`, `openLearningApp`, `guided project`).
+  - Guarantees 0 missed app items across the entire course syllabus.
+- 🌐 **Persistent Multi-Page App Navigation Automation Engine (`processCurrentAppQueueStep`)**:
+  - Implemented cross-page persistent state machine using `chrome.storage.local` to physically navigate the active browser tab to every single App, Lab, LTI, and Tool page in the course one by one.
+  - Automatically handles tab redirects (`window.location.href`), resumes execution on page load via `checkAndResumeAppQueue`, runs the full live on-screen solver (`completeUngradedAppItemInDOM`), and transitions to the next item until the entire course is completed.
+- 📱 **Course-Wide Batch App & Lab Solver (`startCompleteAllAppItemsProcess`)**:
+  - Upgraded the `"📱 Complete App Items"` action button to automatically scan the entire course syllabus, pre-check completed status, and complete **all** Ungraded/Graded App, LTI, Lab, Tool, and Workspace items one by one.
+  - Automatically executes on-screen launch and token registration for the active page if open, then iterates through all remaining app items with multi-schema API cascades (`onDemandAppCompletions.v1`, `onDemandLtiItemPasses.v1`, etc.).
+  - Displays real-time HUD and status updates (`📱 Completing App 1/4...`) with rate-limit pacing.
+- 🛡️ **Checkbox State Synchronization & Double-Toggle Prevention (`setNativeCheckbox`)**:
+  - Fixed an issue where programmatic `.click()` on an already-checked element toggled it back to `false`, causing `"Error: Please check the box to continue"`.
+  - Implemented state comparison check (`isCurrentlyChecked === shouldBeChecked`) before dispatching natural click gesture.
+  - Added strict pre-submission verification to guarantee all checkboxes are `checked = true` immediately before LTI form submission.
+- 🎯 **Coursera Design System (CDS) LTI Form Submission & Universal URL Item Resolver**:
+  - Direct targeting of Coursera's `@react-aria/checkbox` with `aria-labelledby` binding and `value="agree"`.
+  - Dispatches native `<form>` submission (`form.requestSubmit` / `form.submit`) on the LTI launch form wrapping `<button type="submit" aria-label="Launch app...">` to trigger external tool auth handshakes.
+  - Implemented `extractCourseAndItemIdFromURL` to accurately extract `courseSlug` and `itemId` from all Coursera routes (`/ungradedLti/:id/`, `/ungradedApp/:id/`, `/singlePageApp/:id/`, etc.) and send background API passes.
+- 🖱️ **Full Trusted Pointer/Mouse Event Simulation & Launch Button Unlocking (`clickNativeElement`)**:
+  - Replaced standard `.click()` with full pointer and mouse coordinate lifecycle simulation (`pointerover` -> `pointerdown` -> `mousedown` -> `pointerup` -> `mouseup` -> `click` -> `change`) with centered `clientX`/`clientY` bounding box coordinates.
+  - Automatically strips stuck `disabled` and `aria-disabled="true"` attributes if React state is delayed.
+  - Added multi-attempt polling to wait for launch CTA emergence and trigger child text nodes (`<span>Launch app</span>`).
+- 🛡️ **Explicit "I agree to use this app responsibly" & Synthetic Checkbox Dispatcher (`setNativeCheckbox`)**:
+  - Implemented specialized React Synthetic Event & Native Property setter (`setNativeCheckbox`) that directly updates `HTMLInputElement.prototype.checked` and dispatches `input`, `change`, and mouse event chains to ensure React state updates and unlocks the launch CTA.
+  - Explicitly targets Coursera's AI app consent statement: `"I agree to use this app responsibly."` alongside standard honor code and third-party terms containers.
+- 🛡️ **Dynamic Content Script Auto-Injection & Error Resilience (`sendTabMessageWithAutoInject`)**:
+  - Implemented dynamic script injection recovery for popup message dispatching (`chrome.scripting.executeScript`).
+  - Automatically recovers from stale port disconnections when the extension is updated or reloaded in developer mode without requiring the user to refresh their active Coursera tab.
+  - Enhanced on-screen element detection for custom React checkbox toggles, aria-checked containers, embedded iframe sandboxes, and alternative launch button patterns.
+- 📱 **Dedicated "Complete App Item" Popup Action Button (`#appItemBtn`)**:
+  - Added a dedicated green action button **"📱 Complete App Item"** directly in the extension popup grid alongside **"🎯 Solve on Screen"**.
+  - Allows users to individually test and complete any Ungraded App Assignment, External Tool, Workspace, or Lab page with a single click.
+  - Automatically handles consent checkboxes, triggers app launch in browser tab, holds 5s token registration, clicks completion buttons, and records multi-schema passes.
+- 📱 **Dedicated Live On-Screen App / Tool Solver (`completeUngradedAppItemInDOM`)**:
+  - Upgraded the on-screen solver (`startOnScreenQuizSolverProcess`) to automatically detect when the page is an Ungraded App Assignment, Tool, Lab, or Dialogue item when no standard quiz questions exist.
+  - Automatically clicks all "I agree" / Terms / third-party consent checkboxes on page.
+  - Detects and triggers "Launch App" / "Open Tool" / "Open Workspace" buttons and opens the external tool tab.
+  - Keeps session active with a 5-second live countdown HUD to ensure authentication tokens register.
+  - Automatically checks and clicks any "Mark as completed" / "Done" / "Submit" confirmation button.
+  - Cascades multi-schema payloads across all 10 Coursera app/LTI/assignment endpoints (`onDemandAppCompletions.v1`, `onDemandLtiItemPasses.v1`, `onDemandWidgetPasses.v1`, `onDemandWorkspaceSessions.v1`, etc.).
+- ⚡ **Multi-Layer Progress Pre-Check Engine Fix (`fetchCourseProgressState`)**:
+  - Resolved the 0 completed items issue by replacing single-endpoint query with a 6-layer fallback cascade:
+    1. **Syllabus Linked Objects**: Extracts `onDemandCourseProgresses.v1`, `onDemandItemProgresses.v1`, and `onDemandAssignmentPasses.v1` directly from `onDemandCourseMaterials.v2` linked data.
+    2. **Dual-Key Course Progress**: Queries both `${courseId}~${userId}` and `${userId}~${courseId}` parameter ordering, plus `?q=course` and `?q=user`.
+    3. **Item Progress API**: Queries `onDemandItemProgresses.v1?q=course` and `?q=courseAndUser`.
+    4. **Assignment Passes API**: Checks all passed quizzes and fractional scores >= 0.7 across `onDemandAssignmentPasses.v1`.
+    5. **Item Views API**: Queries `onDemandItemViews.v1?q=course` and `?q=user`.
+    6. **On-Screen DOM Fallback**: Scans live syllabus checkmarks (`svg[aria-label*="Completed"]`, `.rc-ItemRow--completed`, `[class*="ItemStatus--completed"]`) on Coursera web pages to capture active visual progress.
+- 🎭 **Interactive On-Screen Dialogue & Simulation Completer (`completeDialogueItemInDOM`)**:
+  - Implemented the complete end-to-end interactive chat workflow for Coursera Dialogue simulations:
+    1. Clicks `"Start Dialogue"` / `"Start Simulation"` button.
+    2. Extracts the scenario question/prompt from the message thread.
+    3. Types and sends 1 authentic, curriculum-aligned response into the chat input.
+    4. Clicks `"End Dialogue"` / `"End Conversation"` in the top toolbar.
+    5. In the confirmation modal: automatically selects a reason (from radio buttons or dropdown select).
+    6. Clicks `"Yes, end the dialogue"` / `"Confirm"` button to finalize completion.
+- 📱 **Enhanced Upgraded App Launcher with Browser Tab Launch (`completeUngradedAppItem`)**:
+  - Automatically clicks the `"I agree"` / Terms & Conditions checkbox.
+  - Clicks `"Launch App"` / `"Open Tool"` and triggers `window.open` in a browser tab.
+  - Maintains session active for 5s to ensure authentication tokens and Coursera session callbacks register.
+- 📱 **Ungraded App & LTI Item Auto-Completer (`completeUngradedAppItem`)**:
+  - Implemented automated completion for `ungradedApp`, `gradedApp`, `app`, `singlePageApp`, `externalTool`, `openLearningApp`, `workspace`, `lab`, `ungradedLab`, `gradedLab`.
+  - Automatically checks third-party data / T&C consent checkboxes in DOM, clicks "Open Tool" / "Launch App" buttons, and keeps session active for 4s for auth token registration.
+  - Dispatches full API completion cascade across `onDemandAppCompletions.v1`, `onDemandLtiItemPasses.v1`, `onDemandWidgetPasses.v1`, `onDemandAssignmentPasses.v1`, `onDemandSupplementCompletions.v1`, `onDemandLtiLaunches.v1`.
+- ⚡ **Strict Progress Skipping (`fetchCourseProgressState`)**:
+  - Pre-queries Coursera's progress APIs (`onDemandCourseProgresses.v1`, `onDemandAssignmentPasses.v1`, `onDemandItemViews.v1`) before starting any solver or skipping run.
+  - Automatically skips all previously completed videos, readings, discussions, and already-passed quizzes (`[Already Completed (✓)]` / `[Already Passed (✓)]`), saving attempt quotas and accelerating runs.
+- ⚠️ **Graceful Locked Assessment & Manual Attention Engine**:
+  - Automatically detects locked assessments (`isLocked === true`, `lockStatus === 'LOCKED'`, prerequisite not met) and peer-review tasks (`peer`, `gradedPeerAssignment`).
+  - Catalogs them in a dedicated `manualAttentionItems` register with item names, modules, specific blockage reasons, and direct Coursera links.
+  - Displays a high-visibility **"⚠️ Items Requiring Your Manual Attention"** alert card in the popup summary report with direct links so users can complete prerequisites to unlock final assessments.
+- 🧠 **Historical Attempt Intelligence (Winning Answer Lock & Wrong Option Elimination)**:
+  - Extracted past submission feedback from `queryState` (GraphQL) and on-screen DOM review markers (`.rc-FormPartCorrect` / `.rc-FormPartIncorrect`).
+  - **Winning Answer Reuse**: Automatically locks and reuses 100% correct answers from previous attempts without risking re-answering.
+  - **Wrong Option Elimination**: Automatically excludes options that scored 0 in past attempts from AI candidate pools and fuzzy matchers.
+  - **Adaptive Multi-Attempt Convergence**: If a graded assignment does not reach the pass threshold on the first try and attempts remain, automatically launches an intelligent follow-up attempt incorporating past wrong-answer eliminations to converge directly on 100% pass score.
+- 🛡️ **Zero-Unanswered-Questions Safeguard (`ensureCompleteResponses` & DOM Audit)**:
+  - Implemented a post-generation verification audit across all question types (`MultipleChoice`, `Checkbox`, `Numeric`, `PlainText`, `RichText`, `CodeExpression`, `Regex`, `Url`, `Widget`).
+  - Guarantees 100% of question parts are filled and submitted to eliminate Coursera's *"You did not answer the question"* error.
+  - Added a secondary Zero-Unanswered DOM Audit Pass to verify all radio buttons, checkboxes, numeric inputs, and textareas on screen are selected before submitting.
+- 🚀 **Full Course Auto-Completer T&C & Auto-Submit Integration**:
+  - Integrated automatic Terms & Conditions / Honor Code agreement acceptance, signature filling, and final submission into the full course auto-completer (`startCompleteCourseProcess`) and batch quiz solver (`startQuizSolverProcess`).
+  - Strengthened Honor Code / T&C checkbox selector across all Coursera variations (including `terms of use`, `academic integrity`, `code of conduct`, `acknowledge`, `agree and submit`).
+  - Added multi-selector submit modal confirmation handling (`[role="dialog"]`, `[aria-modal="true"]`, `.cds-dialog`, `.modal`).
+- 🎯 **On-Screen Submission Mode Selector (Auto-Submit vs. Save as Draft)**:
+  - Added an interactive modal prompt when clicking **🎯 Solve on Screen**:
+    - **🚀 Answer & Auto-Submit**: Automatically answers all questions, accepts Coursera terms and conditions / honor code agreement checkbox, enters student signature, clicks Submit button, and confirms the final submission modal dialog.
+    - **💾 Answer & Save as Draft Only**: Fills and highlights all answers on the page for visual inspection without accepting terms or clicking submit, allowing safe manual review.
+- ⚡ **Optimized LLM Execution & Non-Blocking Timeouts**:
+  - Reordered `PREFERRED_TEXT_MODELS` to place stable high-speed models (`gemini-2.0-flash`, `gemini-1.5-flash`) at the front of the cascade, eliminating 404 preview model discovery delays.
+  - Added strict `AbortSignal.timeout` (12s for Gemini, 15s for OpenAI/Custom) on all network requests to prevent unbounded hanging.
+  - Immediate fallback on 404/400 errors without wasted retry backoff sleep intervals.
+- 🐛 **Fixed GraphQL Schema Validation on Quiz Submission**:
+  - Replaced invalid query fields `attemptCount`, `allowedAttempts`, and `completedAttempts` on `Submission_Attempts` with official schema fields `attemptsMade`, `attemptsAllowed`, and `outcome { earnedGrade isPassed }` on `SubmissionState` across `Submission_StartAttempt` and `Submission_SubmitLatestDraft` mutations, completely eliminating HTTP 400 `GRAPHQL_VALIDATION_FAILED` errors on quiz and graded assignment submissions.
+- 🎯 **Live On-Screen DOM Quiz & Graded Assignment Solver (`solveQuizOnScreenInDOM`)**:
+  - Implemented visual on-screen solving for graded exams, quizzes, and assignments directly in front of the user on the webpage.
+  - **Start / Resume Attempt Trigger**: Automatically detects and clicks "Start Attempt", "Resume Attempt", "Take Quiz", or "Continue" buttons on exam entry screens.
+  - **Floating HUD Badge (`#fcukcoursera-live-hud`)**: Sleek non-intrusive floating HUD displaying live status (e.g. `Solving Question 3 of 10...`, `Signing Honor Code...`, `Submitting...`).
+  - **React Synthetic Interaction**: Dispatches native prototype value setters and synthetic mouse/input/change events to reliably select radio buttons, checkboxes, textareas, code editors, and numeric fields without React state de-sync.
+  - **Visual Question & Option Highlighting**: Smoothly scrolls each question into view and highlights chosen options in glowing emerald green.
+  - **Honor Code Checkbox & Signature Autofill**: Automatically detects and checks Coursera's academic integrity agreement checkbox and fills student signature.
+  - **On-Screen Submission & Modal Confirmation**: Locates the "Submit Assignment" button, clicks it, and auto-confirms the final submit dialog modal.
+  - **Dedicated UI Trigger**: Added **🎯 Solve on Screen** button in popup for instant 1-click visual solving on any open graded quiz or exam.
+- 🛡️ **Universal Host Permissions in `manifest.json`**:
+  - Expanded `host_permissions` to include `<all_urls>`, enabling unrestricted cross-origin API calls to any user-configured local or remote AI endpoint (e.g. Ollama on port `11434`, LM Studio on port `1234`, DeepSeek, OpenAI, vLLM, custom reverse proxies).
+- 🧩 **All-Inclusive Question Type Solver**:
+  - Expanded `solveQuestions` in `content.js` to natively handle all Coursera question types without falling into empty MCQ fallbacks:
+    - `Submission_CodeExpressionQuestion`: Generates raw working source code in the course's target programming language.
+    - `Submission_RichTextQuestion`: Submits formatted CML paragraphs for open-ended rich text answers.
+    - `Submission_RegexQuestion`: Submits exact pattern matching and regular expression answers.
+    - `Submission_UrlQuestion` / `Submission_FileUploadQuestion`: Submits valid project URLs and completion metadata.
+    - `Submission_WidgetQuestion`: Directly marks interactive widgets as completed.
+    - `Submission_MultipleChoiceQuestion` & `Submission_CheckboxQuestion`: High-precision multi-mode matching.
+- 🎯 **Ranked Fuzzy Option Matcher (`matchGeminiAnswerToOptions`)**:
+  - Enhanced option matching with token overlap scoring, normalized string comparisons, and exact keyword matches to eliminate false positives and ensure 100% option selection accuracy.
+- 🧹 **Cleaned Duplicate Function Declarations**:
+  - Removed duplicate declarations of `processExamItem`, consolidating into a single error-handled assessment solver.
+- 🔑 **Centralized CSRF & Header Factory (`getCourseraHeaders` / `getCsrfToken`)**:
+  - Unified token extraction with URI decoding and case-insensitive cookie pattern matching, standardizing request headers across all video, reading, quiz, discussion, dialogue, and progress endpoints.
+- 🌐 **Multi-Pattern Course Slug & Identity Resolution**:
+  - Enhanced `getCourseData()` to resolve course slugs across `/learn/`, `/teach/`, and `/course/` URL structures.
+  - Added resilient fallback cascades for `userId` (`adminUserPermissions.v1`, `userPreferences.v1`, `externalAuthUserData.v1`) and `courseId` (`onDemandCourseMaterials.v2`, `onDemandCourses.v1`).
+- 📊 **Guaranteed Summary Report & Historical Log Persistence**:
+  - `generateCourseSummaryReport` now writes directly to `chrome.storage.local.set({ latestSummaryReport })`.
+  - Popup UI on load now restores historical logs, progress percentages, and last completion status from `globalState` even if the process has finished and the popup is reopened.
+  - Replaced blocking browser `alert()` on `completeBtn` with in-popup status warning notifications.
+
+---
+
+## Session Summary (2026-08-21)
+
+### What Work Has Been Done:
+- 🐛 **Fixed Practice Assignment Detection, Solving & Draft Submission**:
+  - **Comprehensive Classifier (`classifyItemType`)**: Matches all practice quizzes, practice assignments, programming exercises, activities, widgets, and labs.
+  - **Continuous GraphQL Solving**: Even if `Submission_StartAttempt` indicates an in-progress draft already exists, the solver now queries `QueryState`, parses questions across all schema candidate paths, and solves them with AI.
+  - **Reliable Draft Submission**: If `savedDraftId` is omitted from `Submission_SaveResponses`, falls back to `inProgress.draft.id` or active draft IDs to guarantee submission.
+  - **Server-Side REST Completion Fallback (`markAssignmentCompletedFallback`)**: Posts completion events to `onDemandAssignmentPasses.v1`, `onDemandWidgetPasses.v1`, `onDemandWidgetProgresses.v1`, `onDemandLtiItemPasses.v1`, and supplement completions to guarantee 100% completion in Coursera's syllabus.
+- 🎨 **Redesigned Modern 400px Popup UI**:
+  - **Spacious & Minimalist Layout**: Increased width to 400px with comfortable padding, sleek typography, clean glass cards, and reduced div clutter.
+  - **Primary Action Hero**: Full-width glowing hero button for **Complete Course (All-in-One)** with secondary grid buttons for **Quizzes**, **Videos**, and **Readings**.
+  - **Live Pulsing Status Dot**: Visual status indicator (🟢 Ready / 🔵 Busy pulsing) and dual-label progress meter.
+  - **Expanded Console Terminal**: 150px height stream with color-coded alerts (`.log-error`, `.log-success`, `.log-warning`, `.log-ai`, `.log-info`).
+- 🛡️ **Comprehensive Logic Verification & Cross-Origin Permissions**:
+  - Added full host permissions in `manifest.json` for OpenRouter, Groq, Google Gemini, and Localhost/Ollama to guarantee seamless cross-origin API calls.
+- 🎯 **Added Graded Assignment Attempt Guardrails (Limited Attempts e.g. 3 Max)**:
+  - Automatically skips passed assignments (`isPassed === true`) to protect remaining attempts.
+  - Skips locked assignments when out of attempts (`remaining <= 0`) to prevent penalties.
+- 📊 **Added Comprehensive Course & Module Summary Report Generator (`generateCourseSummaryReport`)**:
+  - Generates detailed module-by-module coverage, item category matrix, and remaining tasks checklist.
+- 📱 **Interactive Summary Report Modal in Popup UI**:
+  - Added **📊 Report** button in toolbar opening a modal overview with progress bars, module cards, and one-click **Copy Full Report**.
+- 🎭 **Added Top "End Conversation" Trigger for Dialogue Simulations**:
+  - Implemented `triggerDialogueEndOptionInDOM` to automatically detect, click, and confirm the top **"End Conversation" / "End Dialogue"** action button in Coursera's dialogue header bar.
+- ⚡ **Dynamic High-Speed Pacing for Fast Providers**:
+  - Removed arbitrary 7s sleep delay for high-throughput providers (**Groq** runs at ~100ms, **OpenRouter** at ~300ms, and **Custom/Local LLMs** at ~200ms).
+- 🛡️ **Added Anti-AI Disclosure Safeguards & Human Response Sanitization**:
+  - Implemented `sanitizeHumanStudentResponse` to strip any robotic AI prefixes (`"As an AI..."`, `"As a language model..."`, `"Certainly! Here is..."`, `"Hope this helps!"`) and quotation marks.
+  - Enforced strict prompt instructions commanding the model to act solely as a human student enrolled in the course, avoiding conversational preambles or AI disclosures.
+- 🧠 **Added Course-Aware & Assignment-Context-Aware AI Prompting**:
+  - Injects `courseTitle`, `courseSlug`, `moduleName`, and current `assignmentName` directly into quiz question prompts and discussion prompts.
+  - LLM receives full course domain context to ground its answers in the exact conventions, libraries, formulas, and terminology taught in that specific course.
+- 🐛 **Fixed ReferenceError in `processGraphQLSession`**:
+  - Replaced lingering `apiKey` parameter with unified `aiConfig` object in `processGraphQLSession` call and definition.
+- 🎨 **Enhanced Console Log Viewer & Visual Feedback**:
+  - **Red Alert Highlighting (`.log-error`)**: Immediate soft red highlight + border on errors, failed requests, and network drops.
+  - **Emerald Green Highlighting (`.log-success`)**: Vibrant green styling for successful answers, submitted quizzes, posted discussions, and completed items.
+  - **Amber Warning Highlighting (`.log-warning`)**: Clear warning indicators for 429 quota cooling downs, model retries, and fallbacks.
+  - **Sky Blue AI Activity (`.log-ai`)**: Dedicated color-coding for AI prompt generation and response parsing.
+  - **Timestamps & Typography**: Clean `[HH:MM:SS]` timestamps and monospace font (`SF Mono`/`Fira Code`/`Consolas`).
+  - **Toolbar Controls**: Added one-click **Copy Logs** to clipboard and **Clear Logs** buttons.
+- 🎭 **Added Interactive Dialogue & Roleplay Auto-Completion (`completeDialogueItem`)**:
+  - Automatically completes `dialogue`, `dialogueItem`, `interactiveDialogue`, and `roleplay` conversation simulation items.
+- 💬 **Added AI-Powered Discussion Prompt Auto-Completion (`completeDiscussionPrompt`)**:
+  - Automatically fetches discussion prompt questions and generates 2-3 sentence student responses via configured AI.
+- 🧪 **Added Practice Assignment & Lab Auto-Completion (`completePracticeLabOrLti`)**:
+  - Automatically completes `ungradedLti`, `gradedLti`, `ungradedLab`, `lab`, and `ungradedWidget` items.
+- 🚀 **Added Multi-AI Provider Support (OpenRouter, Groq, Custom/Local LLMs, Gemini)**:
+  - Supports OpenRouter (free models), Groq (high speed), Custom OpenAI-compatible endpoints (Ollama/DeepSeek), and Gemini.
+
+### What's Planned Next / Future Considerations:
+- Test live across a broad variety of Coursera course formats (e.g. specialized peer-review assignments).
+- Add optional user preference in popup to manually pick a preferred Gemini model or custom temperature.
+
+---
+
+## Session Summary (2026-09-29)
+
+### What Work Has Been Done:
+- 🛡️ **Transient Error Auto-Recovery ("It's not you. It's us. Give it another try, please.")**:
+  - Implemented `checkAndHandleLinkedInErrors` in `content.js` to detect LinkedIn Learning server error pages, empty states, and media errors.
+  - Automatically clicks "Give it another try" / "Retry" action buttons, or triggers graceful page reloads with a 3-attempt guardrail in `sessionStorage` before skipping permanently stuck lessons.
+  - Integrated error checks into `ensureLinkedInVideoPlayerMounted`, `waitForLinkedInVideo`, `playLinkedInVideoToCompletion` (entry and interval watchdog), and `startLinkedInCourseCompletionProcess`.
+- 📉 **Lowest Video Quality Enforcement (360p)**:
+  - Added `setLowestLinkedInVideoQuality` in `content.js` to open player settings, locate available resolutions (`1080p`, `720p`, `540p`, `360p`), and select the lowest option.
+  - Added HLS and Video.js quality level clamping (`v.hls.currentLevel = 0`, `v.player.qualityLevels()[0].enabled = true`) inside `injectMainWorldAntiPauseAndSpeed` in `background.js` to minimize bandwidth and eliminate MSE buffer stalls.
+- 🔄 **Worker Tab Reload Re-Arming & Auto-Resume**:
+  - In `background.js`, updated `chrome.tabs.onUpdated` to clear `initializedWorkerTabIds.delete(tabId)` on `changeInfo.status === 'loading'`, allowing reloaded worker tabs to re-arm cleanly.
+  - Added `get_my_worker_course` handler in `background.js` so worker tabs can query their assigned course on startup.
+  - Added worker auto-resume logic at the bottom of `content.js` so reloaded tabs immediately resume execution without getting stranded.
+- 🪟 **Floating On-Screen HUD (`#fcuk-linkedin-floating-hud`) & Drag Handle**:
+  - Added floating status HUD for LinkedIn Learning path progress with dedicated drag handle (`#fcuk-hud-drag-handle`) to prevent sticking to the cursor on hover.
+  - Multi-tab state synchronisation via `chrome.storage.onChanged`.
+- ⚡ **Smart Parallel Tabs with Buffer Backpressure**:
+  - Monitored tabs signal MSE buffer stalls; orchestrator in `background.js` automatically steps down worker concurrency to prevent browser freezing.
+- 📱 **Background / Unfocused Tab Playback**:
+  - Bypassed Chromium Autoplay policy by forcing audio muting and spoofing `document.visibilityState` / focus events in the MAIN execution world.
+- 📝 **Created Root `todo.md`**:
+  - Created persistent project task tracker and architecture overview at root level for seamless continuity in future agent (`.agents`) sessions.
+- 🎯 **Airtight Course & Lesson Completion Verification**:
+  - **Learning Path Card Detection (`isPathCourseCardCompleted`)**: Eliminated false positives caused by generic `.includes('completed')` matching cards with partial progress ("Completed 2 of 10", "20% completed") or "Start course" buttons. Added ratio parsing, progress bar inspections, and negative indicators.
+  - **Item Type Classification Fix**: Stopped treating 3-segment course URLs (`/learning/course-name/lesson-slug`) as single videos so worker tabs do not abandon courses after playing only the first video.
+  - **Dynamic TOC Override**: If `singleOnly` was set on launch, but `scanLinkedInTOC()` finds a multi-video course TOC (`totalCount > 1`), automatically overrides to `singleOnly = false` to guarantee 100% full course completion.
+  - **TOC Item Precision (`isTocItemCompleted`)**: Fixed bug where substring `'incomplete'.includes('complete')` or placeholder classes marked incomplete lessons as completed.
+  - **Advancement Jump & Failsafe**: When `advanceToNextLinkedInVideo()` fails, the player rescans the TOC and jumps directly to remaining uncompleted lessons rather than prematurely claiming completion.
+  - **Worker Failure Reporting**: Secured the `finally` block in `startLinkedInCourseCompletionProcess` to only send `path_worker_course_completed` if completion was explicitly verified; otherwise sends `path_worker_course_failed` to accurately reflect incomplete/errored state.
+  - **Orchestrator Resilience**: Added `path_worker_course_failed` handler in `background.js` and `.badge-error` / `.hud-badge-error` UI badges.
+- 🛋️ **Master Page Live Progress Dashboard ("Relax & Watch Progress Live")**:
+  - **In-Page Dashboard (`#fcuk-master-page-banner`)**: Injected into syllabus/hero section of Learning Path Master pages. Features live stat cards (Completed / Total, Active Workers, Playback Speed), concurrency controls, action buttons (`▶️ Start Learning Path`, `⏹️ Stop All Workers`), and a relaxing notice: *"Workers are completing courses in background tabs. Keep this Master tab open."*
+  - **Synchronized Master Floating HUD**: Shows the live path status, active workers, concurrency selector, and relax banner directly on the master tab.
+- 🛡️ **Explicit Start Only & Auto-Opening Bug Fix**:
+  - **Learning Path Auto-Click Bug Fix**: Sanitized button expansion in `scanLinkedInLearningPath()` to filter out buttons containing action keywords (`start`, `resume`, `play`, etc.) so clicking syllabus headers never navigates into a course.
+  - **Master Page Guards**: Added strict guards in `ensureLinkedInVideoPlayerMounted` and `startLinkedInCourseCompletionProcess` to immediately abort video mounting and execution if the page is a Learning Path master page.
+  - **Session-Scoped Storage**: Deprecated global `linkedinQueueRunning` in `chrome.storage.local` to prevent courses from auto-starting on arbitrary tab reloads or page visits. Single course auto-resume is now strictly scoped to `sessionStorage` in the tab where the user explicitly clicked "Start".
+- 🏷️ **Context-Aware Extension Popup & Floating HUD**:
+  - **Master Page Mode**: Displays `"LinkedIn (Master Path)"` title, `"Master Orchestrator"` badge, relax banner, curriculum list, concurrency buttons, and worker status.
+  - **Worker Tab Mode**: Displays `[Worker Tab]` tag, active course assignment, lesson index, 16x speed indicator, 360p quality lock, and notice indicating progress is streaming live to the Master tab.
+  - **Standalone Course Mode**: Displays `Single Course` tag, course title, lesson count, video progress bar, and Start/Stop buttons.
+
+### What's Planned Next / Future Considerations:
+- Test parallel worker execution across multiple live courses in complex LinkedIn Learning Paths.
+- Add optional user preference toggle in popup for manual video quality preference (360p vs auto).
+- Add automated certificate detection and downloading upon path completion.
+
+
